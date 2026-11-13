@@ -9,6 +9,7 @@
 //!
 //! All trace-upload and URL-based header injection is intentionally *not* here.
 //! The session puts per-request headers (proxy auth, OTel context, etc.) into [`SamplerConfig::extra_headers`] before constructing the client.
+//! OpenCode Go is the exception: each request copies `x-grok-session-id` onto `x-opencode-session`, because that id is chosen per conversation and is not known when the client is built.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +88,33 @@ impl GrokRequestHeaders<'_> {
         }
         b
     }
+}
+
+/// OpenCode Go chat and responses bases, current and legacy.
+/// A stable per-conversation id has to ride `x-opencode-session` on these URLs only.
+fn is_opencode_go_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("opencode.ai")
+        && (url.path().starts_with("/inference/go/") || url.path().starts_with("/zen/go/v1/"))
+}
+
+/// Copy the Grok session id onto `x-opencode-session` when this request targets OpenCode Go.
+/// Absent or empty session ids are left unset so other providers, and Go calls with no session, stay unchanged.
+fn apply_opencode_go_session_header(request: &mut reqwest::Request) {
+    if !is_opencode_go_url(request.url()) {
+        return;
+    }
+    let Some(session_id) = request
+        .headers()
+        .get("x-grok-session-id")
+        .cloned()
+        .filter(|value| !value.as_bytes().is_empty())
+    else {
+        return;
+    };
+    request
+        .headers_mut()
+        .insert(HeaderName::from_static("x-opencode-session"), session_id);
 }
 
 /// Deserialize a Responses SSE event, stripping unknown tools and rewriting terminal `total_tokens` from `context_details`.
@@ -1005,6 +1033,7 @@ impl SamplingClient {
             json
         };
         *request.body_mut() = Some(reqwest::Body::from(body));
+        apply_opencode_go_session_header(&mut request);
         Ok(request)
     }
 
@@ -2341,6 +2370,120 @@ mod tests {
             model: "test-model".to_string(),
             context_window: 8192,
             ..Default::default()
+        }
+    }
+
+    /// Build a request the way the sampler would, and do not send it.
+    async fn built_sampling_request(
+        base_url: &str,
+        path: &str,
+        session_id: Option<&str>,
+    ) -> reqwest::Request {
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: base_url.to_string(),
+            ..minimal_config()
+        })
+        .expect("client");
+        let SentRequest { mut builder, .. } = client.post(client.endpoint(path));
+        if let Some(session_id) = session_id {
+            builder = builder.header("x-grok-session-id", session_id);
+        }
+        client
+            .build_json_request(builder, &serde_json::json!({ "model": "m" }))
+            .await
+            .expect("request builds without sending")
+    }
+
+    fn opencode_session(request: &reqwest::Request) -> Option<&str> {
+        request
+            .headers()
+            .get("x-opencode-session")
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn opencode_go_reuses_the_same_session_header() {
+        let base = "https://opencode.ai/inference/go/openai/v1";
+        let first = built_sampling_request(base, "chat/completions", Some("session-abc")).await;
+        let second = built_sampling_request(base, "chat/completions", Some("session-abc")).await;
+        assert_eq!(opencode_session(&first), Some("session-abc"));
+        assert_eq!(opencode_session(&second), Some("session-abc"));
+    }
+
+    #[tokio::test]
+    async fn opencode_go_keeps_distinct_session_headers() {
+        let base = "https://opencode.ai/inference/go/openai/v1";
+        let first = built_sampling_request(base, "chat/completions", Some("session-abc")).await;
+        let second = built_sampling_request(base, "chat/completions", Some("session-xyz")).await;
+        assert_eq!(opencode_session(&first), Some("session-abc"));
+        assert_eq!(opencode_session(&second), Some("session-xyz"));
+    }
+
+    #[tokio::test]
+    async fn other_providers_do_not_get_the_opencode_session_header() {
+        let request = built_sampling_request(
+            "https://example.test/v1",
+            "chat/completions",
+            Some("session-abc"),
+        )
+        .await;
+        assert_eq!(opencode_session(&request), None);
+        assert_eq!(
+            request
+                .headers()
+                .get("x-grok-session-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("session-abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_session_header_follows_go_urls_only() {
+        let cases = [
+            (
+                "https://opencode.ai/inference/go/openai/v1",
+                "responses",
+                Some("session-abc"),
+                Some("session-abc"),
+            ),
+            (
+                "https://opencode.ai/zen/go/v1",
+                "chat/completions",
+                Some("session-abc"),
+                Some("session-abc"),
+            ),
+            (
+                "https://opencode.ai/v1",
+                "chat/completions",
+                Some("session-abc"),
+                None,
+            ),
+            (
+                "http://opencode.ai/inference/go/openai/v1",
+                "chat/completions",
+                Some("session-abc"),
+                None,
+            ),
+            (
+                "https://opencode.ai/inference/go/openai/v1",
+                "chat/completions",
+                Some(""),
+                None,
+            ),
+            (
+                "https://opencode.ai/inference/go/openai/v1",
+                "chat/completions",
+                None,
+                None,
+            ),
+        ];
+        for (base_url, path, session_id, expected) in cases {
+            let request = built_sampling_request(base_url, path, session_id).await;
+            assert_eq!(
+                opencode_session(&request),
+                expected,
+                "{base_url} {path} session={session_id:?}"
+            );
         }
     }
 
